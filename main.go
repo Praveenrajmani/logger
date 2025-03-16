@@ -18,6 +18,7 @@ import (
 
 type LogEntry interface{}
 
+// Logger represents the logger
 type Logger[T LogEntry] struct {
 	dirs []string
 	// log buffers
@@ -25,32 +26,36 @@ type Logger[T LogEntry] struct {
 	logMu     sync.Mutex
 
 	// current index
-	currentDir            int
+	currentDirIndex       int
 	currentFile           string
 	currentCompressedSize int64
 	currentFileEntryCount int
 	maxEntriesPerFile     int
 
-	batchSize     int
-	maxSize       int64
-	writeInterval time.Duration
+	batchSize int
+	maxSize   int64
 
-	logChan      chan T
-	wg           sync.WaitGroup
-	writeWorkers int
+	logChan chan T
+	wg      sync.WaitGroup
+	workers int
 	sync.RWMutex
 }
 
-func NewLogger[T LogEntry](dirs []string, batchSize int, maxSize int64, writeInterval time.Duration, writeWorkers int) *Logger[T] {
-	var currentDir int
+// NewLogger returns a logger instance
+func NewLogger[T LogEntry](dirs []string, batchSize int, maxSize int64, flushInterval time.Duration, workers int) *Logger[T] {
+	var currentDirIndex int
 	var foundLock bool
 	var currentCompressedSize int64
+	var currentFile string
+	// check for dir.lock file inside the directories
+	// if present get the compressed size of the directory
 	for index, dir := range dirs {
 		lockFilePath := filepath.Join(dir, "dir.lock")
 		if _, err := os.Stat(lockFilePath); err == nil {
-			currentDir = index
+			currentDirIndex = index
 			foundLock = true
-			currentCompressedSize, err = getCompressedSize(dir)
+
+			currentCompressedSize, currentFile, err = getCurrentDirInfo(dir)
 			if err != nil {
 				panic(err)
 			}
@@ -59,26 +64,32 @@ func NewLogger[T LogEntry](dirs []string, batchSize int, maxSize int64, writeInt
 	}
 
 	l := &Logger[T]{
-		dirs:                  dirs,
-		batchSize:             batchSize,
-		maxSize:               maxSize,
-		writeInterval:         writeInterval,
-		logChan:               make(chan T, batchSize/2),
-		writeWorkers:          writeWorkers,
+		dirs:      dirs,
+		batchSize: batchSize,
+		maxSize:   maxSize,
+		// we need the buffer to be 50%, so that
+		// we can cache the logs during the flush time
+		logChan: make(chan T, batchSize/2),
+		workers: workers,
+		// use double the batchSize because we commit even if the
+		// log buffer is half full
 		logBuffer:             make([]T, 0, batchSize*2),
 		maxEntriesPerFile:     100,
-		currentDir:            currentDir,
+		currentDirIndex:       currentDirIndex,
 		currentCompressedSize: currentCompressedSize,
+		currentFile:           currentFile,
 	}
 
+	// if dir.lock is not found, prepare the first directory
 	if !foundLock {
-		if err := prepareDirectory(l.dirs[l.currentDir]); err != nil {
+		if err := prepareDirectory(l.dirs[l.currentDirIndex]); err != nil {
 			panic(err)
 		}
 	}
 
+	// flush every "flushInterval" duration
 	go func() {
-		ticker := time.NewTicker(l.writeInterval)
+		ticker := time.NewTicker(flushInterval)
 		defer ticker.Stop()
 
 		for {
@@ -93,12 +104,14 @@ func NewLogger[T LogEntry](dirs []string, batchSize int, maxSize int64, writeInt
 		}
 	}()
 
-	for i := 0; i < writeWorkers; i++ {
+	// spawn log workers
+	for i := 0; i < workers; i++ {
 		go l.logWorker()
 	}
 	return l
 }
 
+// WriteLog appends to the buffered logChan
 func (l *Logger[T]) WriteLog(log T) {
 	l.logChan <- log
 }
@@ -115,7 +128,7 @@ func (l *Logger[T]) logWorker() {
 			}
 			l.logMu.Lock()
 			l.logBuffer = append(l.logBuffer, log)
-			// flush if the buffer is half full
+			// flush if the buffer is atleast half full
 			if len(l.logBuffer) >= l.batchSize/2 {
 				l.flush(&l.logBuffer)
 			}
@@ -124,6 +137,7 @@ func (l *Logger[T]) logWorker() {
 	}
 }
 
+// flush the buffer to the logfile
 func (l *Logger[T]) flush(logBuffer *[]T) {
 	l.Lock()
 	defer l.Unlock()
@@ -132,7 +146,7 @@ func (l *Logger[T]) flush(logBuffer *[]T) {
 		return
 	}
 
-	currentDir := l.dirs[l.currentDir]
+	currentDir := l.dirs[l.currentDirIndex]
 	if l.currentFile == "" {
 		l.currentFile = filepath.Join(currentDir, fmt.Sprintf("%d.log", time.Now().UnixNano()))
 		l.currentFileEntryCount = 0
@@ -158,6 +172,7 @@ func (l *Logger[T]) flush(logBuffer *[]T) {
 
 	*logBuffer = (*logBuffer)[:0]
 
+	// if the log file exceeds max entries, compress and close the current file
 	if l.currentFileEntryCount >= l.maxEntriesPerFile {
 		if err := l.compressAndCloseCurrentFile(); err != nil {
 			return
@@ -165,6 +180,9 @@ func (l *Logger[T]) flush(logBuffer *[]T) {
 	}
 }
 
+// compress and close current file
+// if the current dir size exceeds, go to the next
+// directory and prepare it
 func (l *Logger[T]) compressAndCloseCurrentFile() error {
 	input, err := os.ReadFile(l.currentFile)
 	if err != nil {
@@ -196,27 +214,29 @@ func (l *Logger[T]) compressAndCloseCurrentFile() error {
 
 	l.currentCompressedSize += compressedSize
 	if l.currentCompressedSize >= l.maxSize {
-		closeDirectory(l.dirs[l.currentDir])
-		l.currentDir = (l.currentDir + 1) % len(l.dirs)
+		closeDirectory(l.dirs[l.currentDirIndex])
+		l.currentDirIndex = (l.currentDirIndex + 1) % len(l.dirs)
 		l.currentCompressedSize = 0
-		prepareDirectory(l.dirs[l.currentDir])
+		prepareDirectory(l.dirs[l.currentDirIndex])
 	}
 
 	return nil
 }
 
+// ReadLogs reads the logs in descending order of the directory
+// sorted in reverse by filename (timestamp)
 func (l *Logger[T]) ReadLogs(limit int) ([]T, error) {
 	l.Lock()
 	defer l.Unlock()
 
 	var logs []T
 
-	currentDir := l.currentDir
+	currentDirIndex := l.currentDirIndex
 	dirs := make([]string, len(l.dirs))
 	copy(dirs, l.dirs)
 
 	for i := 0; i < len(dirs); i++ {
-		dir := dirs[(currentDir-i+len(dirs))%len(dirs)]
+		dir := dirs[(currentDirIndex-i+len(dirs))%len(dirs)]
 		entries, err := os.ReadDir(dir)
 		if err != nil {
 			continue
@@ -245,6 +265,9 @@ func (b byName) Len() int           { return len(b) }
 func (b byName) Swap(i, j int)      { b[i], b[j] = b[j], b[i] }
 func (b byName) Less(i, j int) bool { return b[i].Name() > b[j].Name() }
 
+// readLogFile will read the logs from the file
+// if the file is compressed, it will decompress, else it will
+// read raw from the file uncompressed
 func readLogFile[T LogEntry](filePath string, logs *[]T, limit int) error {
 	var reader io.Reader
 	file, err := os.OpenFile(filePath, os.O_RDONLY, 0644)
@@ -278,10 +301,13 @@ func readLogFile[T LogEntry](filePath string, logs *[]T, limit int) error {
 	return nil
 }
 
+// removes the lock file
 func closeDirectory(dir string) {
 	os.Remove(filepath.Join(dir, "dir.lock"))
 }
 
+// prepareDirectory prepares the directory by removing the
+// dentries and creates the lock file
 func prepareDirectory(dir string) error {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -300,18 +326,26 @@ func prepareDirectory(dir string) error {
 	return nil
 }
 
-func getCompressedSize(dir string) (size int64, err error) {
+// getCurrentDirInfo will stat the dentries and returns the size
+// of the compressed sizes in the directory and also returns the current file
+func getCurrentDirInfo(dir string) (size int64, currentFile string, err error) {
 	var entries []os.DirEntry
 	entries, err = os.ReadDir(dir)
 	if err != nil {
 		return
 	}
 	for _, entry := range entries {
-		size += getFileSize(filepath.Join(dir, entry.Name()))
+		path := filepath.Join(dir, entry.Name())
+		if filepath.Ext(path) == ".zst" {
+			size += getFileSize(filepath.Join(dir, entry.Name()))
+		} else {
+			currentFile = path
+		}
 	}
 	return
 }
 
+// getFileSize gets the current file size
 func getFileSize(path string) int64 {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -320,6 +354,7 @@ func getFileSize(path string) int64 {
 	return info.Size()
 }
 
+// Stop closes the logChan and waits for go routines to settle
 func (l *Logger[T]) Stop() {
 	close(l.logChan)
 	l.wg.Wait()
